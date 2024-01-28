@@ -63,5 +63,3 @@ Les contributions au projet sont les bienvenues. Veuillez créer une issue ou un
 
 Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
 ```
-
-N'oubliez pas de remplacer `<url_du_dépôt>` et `<nom_du_dépôt>` par les informations réelles de votre dépôt Git. Ce README fournit une introduction claire, des instructions d'utilisation, d'installation et des informations sur la contribution et la licence.
