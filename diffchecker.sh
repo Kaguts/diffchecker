@@ -1,5 +1,5 @@
 #!/bin/bash
-# 
+#
 # diffchecker.sh
 #
 # Description: Ce script compare deux répertoires pour les différences de fichiers et de contenu.
@@ -9,7 +9,7 @@ usage() {
     echo "Usage: $0 [-c] [-d] [-e exclude_pattern] [-h] <source_directory> <destination_directory>"
     echo "  -c : Calculer uniquement les statistiques des répertoires."
     echo "  -d : Générer un rapport détaillé (incluant la comparaison du contenu des fichiers)."
-    echo "  -e : Exclure les fichiers/répertoires correspondant au motif."
+    echo "  -e : Exclure les fichiers/répertoires correspondant au motif (glob, ex: \"*.log\")."
     echo "  -h : Afficher ce message d'aide."
     exit 0
 }
@@ -59,7 +59,7 @@ calculate_directory_stats() {
     if [ -z "$exclude_pattern" ]; then
         total_files=$(find "$dir" -type f | wc -l)
     else
-        total_files=$(find "$dir" -type f | grep -vE "$exclude_pattern" | wc -l)
+        total_files=$(find "$dir" -type f -not -name "$exclude_pattern" | wc -l)
     fi
 
     # Affichage des statistiques.
@@ -73,10 +73,16 @@ calculate_directory_stats() {
 find_differences() {
     local source=$1
     local destination=$2
+    local diff_opts=(-r)
+
+    if [ -n "$exclude_pattern" ]; then
+        diff_opts+=(-x "$exclude_pattern")
+    fi
 
     # Capture des différences entre les répertoires source et destination.
-    local diff_source_to_dest=$(diff -r "$source" "$destination" | grep "^Seulement dans $source")
-    local diff_dest_to_source=$(diff -r "$destination" "$source" | grep "^Seulement dans $destination")
+    # LC_ALL=C garantit des messages "Only in ..." dans une locale fixe, indépendamment de l'environnement.
+    local diff_source_to_dest=$(LC_ALL=C diff "${diff_opts[@]}" "$source" "$destination" | grep "^Only in $source")
+    local diff_dest_to_source=$(LC_ALL=C diff "${diff_opts[@]}" "$destination" "$source" | grep "^Only in $destination")
 
     # Vérification et affichage des différences.
     if [ -z "$diff_source_to_dest" ] && [ -z "$diff_dest_to_source" ]; then
@@ -85,29 +91,51 @@ find_differences() {
         # Affichage des fichiers/répertoires manquants dans chaque direction.
         if [ ! -z "$diff_source_to_dest" ]; then
             echo "Fichiers/répertoires présents dans $source mais absents dans $destination :"
-            echo "$diff_source_to_dest" | sed "s/^Seulement dans \(.*\): /\1\//"
+            echo "$diff_source_to_dest" | sed "s/^Only in \(.*\): /\1\//"
             echo ""
         fi
         if [ ! -z "$diff_dest_to_source" ]; then
             echo "Fichiers/répertoires présents dans $destination mais absents dans $source :"
-            echo "$diff_dest_to_source" | sed "s/^Seulement dans \(.*\): /\1\//"
+            echo "$diff_dest_to_source" | sed "s/^Only in \(.*\): /\1\//"
             echo ""
         fi
     fi
+}
+
+# Fonction pour comparer le contenu des fichiers communs aux deux répertoires.
+compare_file_contents() {
+    local source=$1
+    local destination=$2
+    local diff_opts=(-r)
+
+    if [ -n "$exclude_pattern" ]; then
+        diff_opts+=(-x "$exclude_pattern")
+    fi
+
+    echo "Comparaison du contenu des fichiers :"
+    LC_ALL=C diff "${diff_opts[@]}" "$source" "$destination"
+    echo ""
 }
 
 # Exécution des calculs et affichage des statistiques pour chaque répertoire si demandé.
 if $calculate_stats_only; then
     calculate_directory_stats "$source_dir"
     calculate_directory_stats "$dest_dir"
-    find_differences "$source_dir" "$dest_dir"
     exit 0
 fi
 
+# Comparaison de base : statistiques et différences de fichiers/répertoires.
+calculate_directory_stats "$source_dir"
+calculate_directory_stats "$dest_dir"
+find_differences "$source_dir" "$dest_dir"
+
 # Comparaison des contenus des fichiers et génération du rapport détaillé si demandé.
 if $detailed_report; then
-    calculate_directory_stats "$source_dir"
-    calculate_directory_stats "$dest_dir"
-    compare_file_contents "$source_dir" "$dest_dir"
+    {
+        calculate_directory_stats "$source_dir"
+        calculate_directory_stats "$dest_dir"
+        find_differences "$source_dir" "$dest_dir"
+        compare_file_contents "$source_dir" "$dest_dir"
+    } > "$report_file"
     echo "Rapport généré à : $report_file"
 fi

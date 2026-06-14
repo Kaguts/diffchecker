@@ -27,6 +27,12 @@ Pour utiliser diffchecker, lancez le script avec les options suivantes :
 
 ### Exemples
 
+Comparaison de base (statistiques des deux répertoires et liste des fichiers/répertoires différents) :
+
+```bash
+./diffchecker.sh /chemin/source /chemin/destination
+```
+
 Calculer uniquement les statistiques des répertoires :
 
 ```bash
