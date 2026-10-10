@@ -3,30 +3,40 @@
 # diffchecker.sh
 #
 # Description: Ce script compare deux répertoires pour les différences de fichiers et de contenu.
+#
+# Codes de retour (comme diff) :
+#   0 : répertoires identiques (ou statistiques seules avec -c)
+#   1 : des différences ont été trouvées
+#   2 : erreur d'utilisation ou répertoire introuvable
+
+set -uo pipefail
 
 # Fonction affichant comment utiliser le script et ses options.
 usage() {
-    echo "Usage: $0 [-c] [-d] [-e exclude_pattern] [-h] <source_directory> <destination_directory>"
+    echo "Usage: $0 [-c] [-d] [-o fichier] [-e motif]... [-h] <source_directory> <destination_directory>"
     echo "  -c : Calculer uniquement les statistiques des répertoires."
     echo "  -d : Générer un rapport détaillé (incluant la comparaison du contenu des fichiers)."
+    echo "  -o : Fichier du rapport détaillé (défaut : report_<date>.txt dans le répertoire courant)."
     echo "  -e : Exclure les fichiers/répertoires correspondant au motif (glob, ex: \"*.log\")."
+    echo "       L'option peut être répétée."
     echo "  -h : Afficher ce message d'aide."
-    exit 0
 }
 
 # Initialisation des variables pour les options.
 calculate_stats_only=false
 detailed_report=false
-exclude_pattern=""
+report_file=""
+exclude_patterns=()
 
 # Lecture des options de ligne de commande et affectation aux variables.
-while getopts "cde:h" opt; do
+while getopts "cde:o:h" opt; do
     case $opt in
-        c) calculate_stats_only=true ;;  # Option pour calculer uniquement les statistiques.
-        d) detailed_report=true ;;       # Option pour générer un rapport détaillé.
-        e) exclude_pattern=$OPTARG ;;    # Option pour exclure certains fichiers/répertoires.
-        h) usage ;;                      # Option pour afficher l'aide.
-        ?) usage ;;                      # Afficher l'aide en cas d'option inconnue.
+        c) calculate_stats_only=true ;;      # Option pour calculer uniquement les statistiques.
+        d) detailed_report=true ;;           # Option pour générer un rapport détaillé.
+        e) exclude_patterns+=("$OPTARG") ;;  # Option pour exclure certains fichiers/répertoires.
+        o) report_file=$OPTARG ;;            # Option pour choisir le fichier de rapport.
+        h) usage; exit 0 ;;                  # Option pour afficher l'aide.
+        ?) usage >&2; exit 2 ;;              # Option inconnue : aide sur la sortie d'erreur.
     esac
 done
 
@@ -35,31 +45,50 @@ shift $((OPTIND -1))
 
 # Vérification du nombre d'arguments (doit être 2).
 if [ "$#" -ne 2 ]; then
-    usage
+    usage >&2
+    exit 2
 fi
 
-# Attribution des répertoires source et destination.
-source_dir=$1
-dest_dir=$2
-report_file="report_$(date +%Y%m%d_%H%M%S).txt"
+# Attribution des répertoires source et destination (sans "/" final, pour que
+# les chemins affichés par diff soient prévisibles).
+source_dir=${1%/}
+dest_dir=${2%/}
+[ -n "$source_dir" ] || source_dir=/
+[ -n "$dest_dir" ] || dest_dir=/
+[ -n "$report_file" ] || report_file="report_$(date +%Y%m%d_%H%M%S).txt"
 
 # Vérification de l'existence des répertoires.
-if [ ! -d "$source_dir" ] || [ ! -d "$dest_dir" ]; then
-    echo "Erreur : Répertoires non trouvés."
-    exit 1
-fi
+for dir in "$source_dir" "$dest_dir"; do
+    if [ ! -d "$dir" ]; then
+        echo "Erreur : répertoire introuvable : $dir" >&2
+        exit 2
+    fi
+done
+
+# Les mêmes exclusions s'appliquent partout : au comptage (find), au calcul
+# de taille (du) et à la comparaison (diff). Comme `diff -x`, un motif porte
+# sur le nom d'un fichier ou d'un répertoire, à n'importe quelle profondeur.
+find_excludes=()
+du_excludes=()
+diff_excludes=()
+for pattern in "${exclude_patterns[@]}"; do
+    [ "${#find_excludes[@]}" -gt 0 ] && find_excludes+=(-o)
+    find_excludes+=(-name "$pattern")
+    du_excludes+=("--exclude=$pattern")
+    diff_excludes+=(-x "$pattern")
+done
 
 # Fonction pour calculer et afficher les statistiques d'un répertoire.
 calculate_directory_stats() {
     local dir=$1
-    local total_size=$(du -sh "$dir" | cut -f1)  # Calcul de la taille totale.
-    local total_files                           # Variable pour le nombre total de fichiers.
+    local total_size total_files
 
-    # Calcul du nombre de fichiers, en excluant ceux correspondant au motif si spécifié.
-    if [ -z "$exclude_pattern" ]; then
-        total_files=$(find "$dir" -type f | wc -l)
+    total_size=$(du -sh "${du_excludes[@]}" "$dir" 2>/dev/null | cut -f1)
+    if [ "${#find_excludes[@]}" -eq 0 ]; then
+        total_files=$(find "$dir" -type f 2>/dev/null | wc -l)
     else
-        total_files=$(find "$dir" -type f -not -name "$exclude_pattern" | wc -l)
+        # -prune : un répertoire exclu n'est pas parcouru du tout
+        total_files=$(find "$dir" \( "${find_excludes[@]}" \) -prune -o -type f -print 2>/dev/null | wc -l)
     fi
 
     # Affichage des statistiques.
@@ -69,51 +98,79 @@ calculate_directory_stats() {
     echo ""
 }
 
-# Fonction pour trouver les différences entre les répertoires.
-find_differences() {
-    local source=$1
-    local destination=$2
-    local diff_opts=(-r)
+# Résultats de la comparaison (remplis par compare_directories).
+only_in_source=()
+only_in_dest=()
+content_differs=()
+other_differences=()
 
-    if [ -n "$exclude_pattern" ]; then
-        diff_opts+=(-x "$exclude_pattern")
-    fi
+# Compare les deux répertoires en un seul passage de diff et classe chaque
+# différence. LC_ALL=C garantit des messages dans une langue fixe.
+compare_directories() {
+    local line dir name rest rel_len
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Only\ in\ (.*):\ ([^/]*)$ ]]; then
+            dir=${BASH_REMATCH[1]}
+            name=${BASH_REMATCH[2]}
+            # Comparaison exacte du chemin (et non par préfixe : "a" ne doit
+            # pas capter les lignes de "ab").
+            if [ "$dir" = "$source_dir" ] || [[ "$dir" == "$source_dir"/* ]]; then
+                only_in_source+=("$dir/$name")
+            else
+                only_in_dest+=("$dir/$name")
+            fi
+        elif [[ "$line" == "Files $source_dir/"*" differ" ]]; then
+            # "Files <source>/<rel> and <dest>/<rel> differ" : <rel> apparaît
+            # deux fois, on en déduit sa longueur sans dépendre de son contenu.
+            rest=${line#"Files $source_dir/"}
+            rest=${rest%" differ"}
+            rel_len=$(( (${#rest} - ${#dest_dir} - 6) / 2 ))
+            content_differs+=("${rest:0:rel_len}")
+        elif [ -n "$line" ]; then
+            # Types différents (fichier d'un côté, répertoire de l'autre), etc.
+            other_differences+=("$line")
+        fi
+    done < <(LC_ALL=C diff -rq --no-dereference "${diff_excludes[@]}" "$source_dir" "$dest_dir" 2>&1)
+}
 
-    # Capture des différences entre les répertoires source et destination.
-    # LC_ALL=C garantit des messages "Only in ..." dans une locale fixe, indépendamment de l'environnement.
-    local diff_source_to_dest=$(LC_ALL=C diff "${diff_opts[@]}" "$source" "$destination" | grep "^Only in $source")
-    local diff_dest_to_source=$(LC_ALL=C diff "${diff_opts[@]}" "$destination" "$source" | grep "^Only in $destination")
+# Affiche les différences classées par compare_directories.
+print_differences() {
+    local total=$(( ${#only_in_source[@]} + ${#only_in_dest[@]} + ${#content_differs[@]} + ${#other_differences[@]} ))
 
-    # Vérification et affichage des différences.
-    if [ -z "$diff_source_to_dest" ] && [ -z "$diff_dest_to_source" ]; then
+    if [ "$total" -eq 0 ]; then
         echo "Les deux répertoires sont identiques."
-    else
-        # Affichage des fichiers/répertoires manquants dans chaque direction.
-        if [ ! -z "$diff_source_to_dest" ]; then
-            echo "Fichiers/répertoires présents dans $source mais absents dans $destination :"
-            echo "$diff_source_to_dest" | sed "s/^Only in \(.*\): /\1\//"
-            echo ""
-        fi
-        if [ ! -z "$diff_dest_to_source" ]; then
-            echo "Fichiers/répertoires présents dans $destination mais absents dans $source :"
-            echo "$diff_dest_to_source" | sed "s/^Only in \(.*\): /\1\//"
-            echo ""
-        fi
+        echo ""
+        return
     fi
+
+    if [ "${#only_in_source[@]}" -gt 0 ]; then
+        echo "Fichiers/répertoires présents dans $source_dir mais absents dans $dest_dir (${#only_in_source[@]}) :"
+        printf '%s\n' "${only_in_source[@]}"
+        echo ""
+    fi
+    if [ "${#only_in_dest[@]}" -gt 0 ]; then
+        echo "Fichiers/répertoires présents dans $dest_dir mais absents dans $source_dir (${#only_in_dest[@]}) :"
+        printf '%s\n' "${only_in_dest[@]}"
+        echo ""
+    fi
+    if [ "${#content_differs[@]}" -gt 0 ]; then
+        echo "Fichiers présents des deux côtés mais au contenu différent (${#content_differs[@]}) :"
+        printf '%s\n' "${content_differs[@]}"
+        echo ""
+    fi
+    if [ "${#other_differences[@]}" -gt 0 ]; then
+        echo "Autres différences (${#other_differences[@]}) :"
+        printf '%s\n' "${other_differences[@]}"
+        echo ""
+    fi
+    echo "Total : $total différence(s)."
+    echo ""
 }
 
 # Fonction pour comparer le contenu des fichiers communs aux deux répertoires.
 compare_file_contents() {
-    local source=$1
-    local destination=$2
-    local diff_opts=(-r)
-
-    if [ -n "$exclude_pattern" ]; then
-        diff_opts+=(-x "$exclude_pattern")
-    fi
-
     echo "Comparaison du contenu des fichiers :"
-    LC_ALL=C diff "${diff_opts[@]}" "$source" "$destination"
+    LC_ALL=C diff -ru --no-dereference "${diff_excludes[@]}" "$source_dir" "$dest_dir"
     echo ""
 }
 
@@ -125,17 +182,27 @@ if $calculate_stats_only; then
 fi
 
 # Comparaison de base : statistiques et différences de fichiers/répertoires.
-calculate_directory_stats "$source_dir"
-calculate_directory_stats "$dest_dir"
-find_differences "$source_dir" "$dest_dir"
+# Tout est calculé une seule fois, puis réutilisé pour le rapport.
+summary=$(
+    calculate_directory_stats "$source_dir"
+    calculate_directory_stats "$dest_dir"
+)
+compare_directories
+differences=$(print_differences)
+
+printf '%s\n\n%s\n' "$summary" "$differences"
 
 # Comparaison des contenus des fichiers et génération du rapport détaillé si demandé.
 if $detailed_report; then
-    {
-        calculate_directory_stats "$source_dir"
-        calculate_directory_stats "$dest_dir"
-        find_differences "$source_dir" "$dest_dir"
-        compare_file_contents "$source_dir" "$dest_dir"
-    } > "$report_file"
+    if ! {
+        printf '%s\n\n%s\n\n' "$summary" "$differences"
+        compare_file_contents
+    } > "$report_file"; then
+        echo "Erreur : impossible d'écrire le rapport dans $report_file" >&2
+        exit 2
+    fi
     echo "Rapport généré à : $report_file"
 fi
+
+total_differences=$(( ${#only_in_source[@]} + ${#only_in_dest[@]} + ${#content_differs[@]} + ${#other_differences[@]} ))
+[ "$total_differences" -eq 0 ]
